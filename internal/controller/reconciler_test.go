@@ -126,6 +126,7 @@ func basePolicy(ckptRoot string, worldSize int) *v1alpha1.TrainingHealthPolicy {
 			ConfirmWindow:        15 * time.Second,
 			SMUtilFloorPct:       5.0,
 			MinDiskIOBytesPerSec: 10 << 20, // 10 MB/s
+			MinRDMABytesPerSec:   1 << 20,  // 1 MB/s NIC ASIC RDMA progress floor
 			FatalXids:            []int32{79, 94, 95},
 			PhaseLeaseTTL: v1alpha1.PhaseLeaseTTL{
 				Eval: 3 * time.Minute,
@@ -346,5 +347,112 @@ func TestWedgedCheckpointTriggersRollbackToVerifiedNMinus1(t *testing.T) {
 	if cluster.patchedCkpt != goodDir || policy.Status.LastVerifiedCkptStep != 500 || policy.Status.StepsLost != 100 {
 		t.Fatalf("expected N-1 rollback to step 500 (%s), got ckpt=%s step=%d lost=%d",
 			goodDir, cluster.patchedCkpt, policy.Status.LastVerifiedCkptStep, policy.Status.StepsLost)
+	}
+}
+
+// Milestone 2 Case 4: Slow cross-switch InfiniBand AllGather straggler still moving RDMA bytes
+// (port_xmit_data/port_rcv_data rising, zero IB/HW errors) past DetectWindow + ConfirmWindow -> ZERO false kill.
+func TestSlowCrossSwitchIBAllGatherZeroFalsePositive(t *testing.T) {
+	ckptRoot, _ := seedCheckpoints(t, 8, false)
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+
+	samples := make([]telemetry.RankSample, 8)
+	for r := 0; r < 8; r++ {
+		samples[r] = telemetry.RankSample{
+			JobUID:             "job-uid-001",
+			NodeName:           fmt.Sprintf("h100-node-%d", r),
+			PodName:            fmt.Sprintf("llama-worker-%d", r),
+			Rank:               int32(r),
+			SMUtilPct:          0.0,
+			VRAMUsedMB:         74000,
+			LastCompletedSeqID: 5100,
+			OpenCollective: &telemetry.CollectiveSpan{
+				SeqID:     5101,
+				OpName:    "AllGather",
+				StartedAt: now.Add(-90 * time.Second), // longer than DetectWindow + ConfirmWindow
+				Completed: false,
+			},
+			RDMAProgressBytesPerSec: 0, // peers waiting on slow straggler
+			IBErrDelta:              0,
+			RDMAHWErrorDelta:        0,
+			ObservedAt:              now,
+		}
+	}
+	// Straggler rank 7 is actively transferring RDMA bytes over congested cross-switch IB with zero errors.
+	samples[7].RDMAProgressBytesPerSec = 450 << 20 // 450 MB/s active port_xmit_data/port_rcv_data progress
+
+	cluster := &fakeClusterClient{}
+	hook := &fakeWebhook{}
+	curTime := now
+	rec := &TrainingHealthReconciler{
+		Telemetry: &fakeTelemetryStore{samples: samples},
+		Cluster:   cluster,
+		Notifier:  hook,
+		Now:       func() time.Time { return curTime },
+	}
+	policy := basePolicy(ckptRoot, 8)
+
+	for i := 0; i < 5; i++ {
+		if _, err := rec.Reconcile(context.Background(), policy); err != nil {
+			t.Fatal(err)
+		}
+		curTime = curTime.Add(15 * time.Second)
+	}
+
+	if policy.Status.State != v1alpha1.StateHealthy || len(cluster.cordonedNodes) != 0 || len(hook.events) != 0 {
+		t.Fatalf("expected zero false positive on progressing slow cross-switch AllGather, state=%s cordoned=%v",
+			policy.Status.State, cluster.cordonedNodes)
+	}
+}
+
+// Milestone 2 Case 5: ConnectX ASIC hw_counter fault (e.g., local_ack_timeout_err) isolates the bad node immediately.
+func TestConnectXHWCounterFaultIsolated(t *testing.T) {
+	ckptRoot, goodDir := seedCheckpoints(t, 4, false)
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+
+	samples := make([]telemetry.RankSample, 4)
+	for r := 0; r < 4; r++ {
+		samples[r] = telemetry.RankSample{
+			JobUID:             "job-uid-001",
+			NodeName:           fmt.Sprintf("h100-node-%d", r),
+			Rank:               int32(r),
+			SMUtilPct:          0.0,
+			VRAMUsedMB:         74000,
+			LastCompletedSeqID: 6000,
+			OpenCollective: &telemetry.CollectiveSpan{
+				SeqID:     6001,
+				OpName:    "AllGather",
+				StartedAt: now.Add(-50 * time.Second),
+				Completed: false,
+			},
+			ObservedAt: now,
+		}
+	}
+	samples[2].RDMAHWErrorDelta = 3 // local_ack_timeout_err / packet_seq_err burst on node 2
+
+	cluster := &fakeClusterClient{}
+	hook := &fakeWebhook{}
+	curTime := now
+	rec := &TrainingHealthReconciler{
+		Telemetry: &fakeTelemetryStore{samples: samples},
+		Cluster:   cluster,
+		Notifier:  hook,
+		Now:       func() time.Time { return curTime },
+	}
+	policy := basePolicy(ckptRoot, 4)
+
+	_, _ = rec.Reconcile(context.Background(), policy) // Suspect
+	_, _ = rec.Reconcile(context.Background(), policy) // Confirming
+	curTime = curTime.Add(15 * time.Second)
+	if _, err := rec.Reconcile(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+
+	if policy.Status.State != v1alpha1.StateRecovering || policy.Status.CulpritRank != 2 || policy.Status.CulpritNode != "h100-node-2" {
+		t.Fatalf("expected culprit rank 2 (h100-node-2) recovering, got state=%s rank=%d node=%s",
+			policy.Status.State, policy.Status.CulpritRank, policy.Status.CulpritNode)
+	}
+	if cluster.patchedCkpt != goodDir || len(hook.events) != 1 || hook.events[0].CulpritRank != 2 {
+		t.Fatalf("expected rollback to %s and webhook for rank 2, got ckpt=%s events=%+v", goodDir, cluster.patchedCkpt, hook.events)
 	}
 }

@@ -24,6 +24,8 @@ func main() {
 	if err != nil {
 		log.Printf("infiniband counters unavailable (%v); continuing with NVML/FlightRecorder signals", err)
 	} else {
-		fmt.Printf("initial_ib_port_errors=%d\n", errs)
+		dataBytes, _ := telemetry.ReadIBDataBytes(*ibRoot)
+		hwErrs, _ := telemetry.ReadIBHWErrors(*ibRoot)
+		fmt.Printf("initial_ib_port_errors=%d initial_ib_data_bytes=%d initial_ib_hw_errors=%d\n", errs, dataBytes, hwErrs)
 	}
 }

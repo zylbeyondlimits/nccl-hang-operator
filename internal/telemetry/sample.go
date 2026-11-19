@@ -35,10 +35,12 @@ type RankSample struct {
 	SMUtilPct            float32         `json:"sm_util_pct"`
 	VRAMUsedMB           uint64          `json:"vram_used_mb"`
 	OpenCollective       *CollectiveSpan `json:"open_collective,omitempty"`
-	LastCompletedSeqID   uint64          `json:"last_completed_seq_id"`
-	ProcWriteBytesPerSec uint64          `json:"proc_write_bytes_per_sec"`
-	IBErrDelta           uint64          `json:"ib_err_delta"`
-	FatalXids            []int32         `json:"fatal_xids,omitempty"`
+	LastCompletedSeqID      uint64          `json:"last_completed_seq_id"`
+	ProcWriteBytesPerSec    uint64          `json:"proc_write_bytes_per_sec"`
+	RDMAProgressBytesPerSec uint64          `json:"rdma_progress_bytes_per_sec"`
+	IBErrDelta              uint64          `json:"ib_err_delta"`
+	RDMAHWErrorDelta        uint64          `json:"rdma_hw_error_delta"`
+	FatalXids               []int32         `json:"fatal_xids,omitempty"`
 	Phase                string          `json:"phase"`
 	PhaseLeaseUntil      time.Time       `json:"phase_lease_until"`
 	ObservedAt           time.Time       `json:"observed_at"`
@@ -96,6 +98,62 @@ func ReadIBPortErrors(ibRoot string) (uint64, error) {
 	var total uint64
 	counters := []string{"port_rcv_errors", "link_downed", "port_xmit_discards"}
 	matches, err := filepath.Glob(filepath.Join(ibRoot, "*", "ports", "*", "counters"))
+	if err != nil {
+		return 0, err
+	}
+	for _, dir := range matches {
+		for _, name := range counters {
+			raw, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				continue
+			}
+			v, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+			if err == nil {
+				total += v
+			}
+		}
+	}
+	return total, nil
+}
+
+// ReadIBDataBytes aggregates port_xmit_data and port_rcv_data from /sys/class/infiniband.
+// Per the IBTA specification, Linux sysfs reports these counters in 32-bit words (4-byte octets),
+// so each counter value is multiplied by 4 to yield total RDMA bytes transferred at ASIC line rate
+// with zero datapath overhead.
+func ReadIBDataBytes(ibRoot string) (uint64, error) {
+	if ibRoot == "" {
+		ibRoot = "/sys/class/infiniband"
+	}
+	var totalBytes uint64
+	counters := []string{"port_xmit_data", "port_rcv_data"}
+	matches, err := filepath.Glob(filepath.Join(ibRoot, "*", "ports", "*", "counters"))
+	if err != nil {
+		return 0, err
+	}
+	for _, dir := range matches {
+		for _, name := range counters {
+			raw, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				continue
+			}
+			words, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+			if err == nil {
+				totalBytes += words * 4
+			}
+		}
+	}
+	return totalBytes, nil
+}
+
+// ReadIBHWErrors aggregates ConnectX ASIC hw_counters indicative of RDMA fabric faults
+// (local_ack_timeout_err, packet_seq_err, out_of_sequence) without hooking hot-path WQEs.
+func ReadIBHWErrors(ibRoot string) (uint64, error) {
+	if ibRoot == "" {
+		ibRoot = "/sys/class/infiniband"
+	}
+	var total uint64
+	counters := []string{"local_ack_timeout_err", "packet_seq_err", "out_of_sequence"}
+	matches, err := filepath.Glob(filepath.Join(ibRoot, "*", "ports", "*", "hw_counters"))
 	if err != nil {
 		return 0, err
 	}

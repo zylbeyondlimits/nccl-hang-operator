@@ -8,18 +8,19 @@ Default NCCL watchdogs (`TORCH_NCCL_ASYNC_ERROR_HANDLING` / `NCCL_TIMEOUT`) sit 
 
 ## Architecture
 
-1. **Userspace PyTorch Flight Recorder + Least-Privilege CO-RE eBPF DaemonSet (`cmd/node-agent`, `internal/telemetry`)**
+1. **Userspace PyTorch Flight Recorder + Zero-Overhead NIC ASIC Counters + Slow-Path CO-RE eBPF (`cmd/node-agent`, `internal/telemetry`)**
    - Flight Recorder stays strictly in userspace (`TORCH_NCCL_TRACE_BUFFER_SIZE=2000` dumped via `/dev/shm` shared `emptyDir`, zero kernel risk).
-   - Kernel tracing uses CO-RE eBPF (`CAP_BPF` + `CAP_PERFMON` only, no `--privileged`) on RDMA/VFS I/O paths (`vfs_write`, `tcp_retransmit_skb`, `ib_post_send`), with an automatic BTF preflight check (`DetectCollectorMode`) that gracefully degrades to `/proc/<pid>/io` + `/sys/class/infiniband` + NVML polling on older kernels.
+   - **Zero-Overhead 400Gbps RDMA Telemetry**: Because NCCL runs userspace kernel-bypass RDMA (`libibverbs` / `mlx5` doorbell rings + GPUDirect), collective WQEs never hit kernel `ib_post_send` and must never be trapped on the hot path. Instead, `node-agent` polls ConnectX NIC ASIC hardware counters every 1–5s via `rdma` netlink (`RDMA_NLDEV_CMD_STAT_GET`) / sysfs (`port_xmit_data`, `port_rcv_data`, and `hw_counters` such as `local_ack_timeout_err`, `packet_seq_err`, `out_of_sequence`) at line rate with **0% datapath overhead**.
+   - **Slow/Error-Path CO-RE eBPF Only**: Least-privilege CO-RE eBPF (`CAP_BPF` + `CAP_PERFMON`, no `--privileged`) attaches strictly off the 400Gbps hot path — `ib_dispatch_event` (QP fatal / port-down faults only), `tcp_retransmit_skb` (OOB bootstrap stalls), and `vfs_write` filtered by training PID into a `BPF_MAP_TYPE_PERCPU_ARRAY` (no per-syscall ringbuf spam) for checkpoint flush detection — with an automatic BTF preflight check (`DetectCollectorMode`) that gracefully degrades to `/proc/<pid>/io` + `/sys/class/infiniband` + NVML polling on older kernels.
 2. **False-Positive-Free Hang Detection & Culprit Isolation (`internal/controller`)**
-   - **Open vs. Completed Collectives**: Distinguishes ranks parked inside an *open* unfinished NCCL collective (`Completed == false`) from healthy pauses between steps.
+   - **Open vs. Completed Collectives + RDMA Progress Gating**: Distinguishes deadlocked open NCCL collectives (`Completed == false`, zero RDMA byte progress) from legitimate slow cross-switch InfiniBand/RoCE `AllGather` stragglers that are still actively transferring bytes (`RDMAProgressBytesPerSec >= 1MB/s`, zero IB/HW errors).
    - **Eval & Checkpoint Backoff**: Suppresses false kills when GPU forward passes remain active (`SMUtilPct >= 5%`), storage write throughput is climbing (`ProcWriteBytesPerSec >= 10MB/s`), or a bounded `/dev/shm/phase.json` lease (`eval: 3m`, `ckpt: 5m`) is active.
    - **Two-Stage FSM**: `Healthy -> Suspect -> Confirming -> Quarantining -> Recovering`.
-   - **Culprit Ranking**: Prioritizes fatal NVML Xids (`79, 94, 95`) and InfiniBand/RoCE error deltas, then diffs Flight Recorder `LastCompletedSeqID` across ranks (`argmin`) to isolate the lagging culprit instead of innocent waiting ranks.
-3. **Atomic Sharded Checkpoint Verifier & `N-1` Rollback (`internal/checkpoint`)**
+   - **Culprit Ranking**: Prioritizes fatal NVML Xids (`79, 94, 95`) and InfiniBand/ConnectX `hw_counters` error deltas, then diffs Flight Recorder `LastCompletedSeqID` across ranks (`argmin`) to isolate the lagging culprit instead of innocent waiting ranks.
+3. **Atomic Sharded Checkpoint Verifier, `N-1` Rollback & Async Devin Bot RCA (`internal/checkpoint`, `internal/controller`)**
    - Rejects directories with leftover `.tmp`/`.incomplete` artifacts.
    - Validates `world_size` shard completeness, step parity across model weights / optimizer / dataloader, SHA256 checksums, and `.safetensors` 8-byte JSON header offset bounds (catching truncated writes without loading 100GB tensors into RAM).
-   - Automatically rolls back to the newest verified `N-1` step and patches `PyTorchJob` with an **immutable pinned checkpoint path** (never `latest`).
+   - Automatically rolls back to the newest verified `N-1` step, patches `PyTorchJob` with an **immutable pinned checkpoint path** (never `latest`), and dispatches an `IncidentPayload` webhook to **Devin Bot** for async root-cause analysis (opening training-code PRs for rank `seq_id` mismatches or node RCA/RMA tickets for Xid/fabric faults).
 
 ## Project Layout
 
@@ -48,3 +49,5 @@ Deterministic fault-injection tests cover:
 - **Slow Lustre checkpoint flush** (`SM=0%`, `openCollective=nil`, `120 MB/s` disk write) -> zero false kills.
 - **Evaluation loop** (paused training collectives, `62.5%` SM forward passes) -> zero false kills.
 - **Wedged checkpoint past lease + truncated `.safetensors` shard on step `K`** -> catches wedged flush and automatically rolls `PyTorchJob` back to verified step `K-1`.
+- **Slow cross-switch InfiniBand `AllGather` straggler** (`OpenCollective=AllGather` past `DetectWindow + ConfirmWindow`, `port_xmit_data` moving at `450 MB/s`, zero IB/HW errors) -> zero false kills.
+- **ConnectX ASIC `hw_counters` fault** (`local_ack_timeout_err` / `packet_seq_err` burst) -> isolates the faulty node immediately and dispatches the Devin Bot incident webhook.
