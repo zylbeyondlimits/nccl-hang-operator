@@ -1,0 +1,76 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: traininghealthpolicies.nccl.infra.io
+spec:
+  group: nccl.infra.io
+  names:
+    kind: TrainingHealthPolicy
+    listKind: TrainingHealthPolicyList
+    plural: traininghealthpolicies
+    singular: traininghealthpolicy
+    shortNames:
+      - thp
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - targetRef
+                - detectWindow
+                - confirmWindow
+                - remediation
+              properties:
+                targetRef:
+                  type: object
+                  required: [kind, name, worldSize]
+                  properties:
+                    apiVersion: { type: string }
+                    kind: { type: string, enum: [PyTorchJob, JobSet] }
+                    namespace: { type: string }
+                    name: { type: string }
+                    worldSize: { type: integer, minimum: 1 }
+                detectWindow: { type: string, default: "45s" }
+                confirmWindow: { type: string, default: "15s" }
+                smUtilFloorPct: { type: number, default: 5 }
+                minDiskIoBytesPerSec: { type: integer, default: 10485760 }
+                fatalXids:
+                  type: array
+                  items: { type: integer }
+                phaseLeaseTTL:
+                  type: object
+                  properties:
+                    eval: { type: string, default: "3m" }
+                    ckpt: { type: string, default: "5m" }
+                remediation:
+                  type: object
+                  required: [taintKey, taintEffect, warmSpareLabel, checkpointRoot]
+                  properties:
+                    taintKey: { type: string, default: "gpu.infra.io/unhealthy" }
+                    taintEffect: { type: string, default: "NoSchedule" }
+                    warmSpareLabel: { type: string }
+                    dcgmDiagLevel: { type: integer, default: 3 }
+                    webhookURL: { type: string }
+                    checkpointRoot: { type: string }
+            status:
+              type: object
+              properties:
+                state:
+                  type: string
+                  enum: [Healthy, Suspect, Confirming, Quarantining, Recovering]
+                culpritNode: { type: string }
+                culpritRank: { type: integer }
+                culpritReason: { type: string }
+                lastVerifiedCkptPath: { type: string }
+                lastVerifiedCkptStep: { type: integer }
+                stepsLost: { type: integer }
+                gpuHoursSaved: { type: number }

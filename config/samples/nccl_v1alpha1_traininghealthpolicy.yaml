@@ -1,0 +1,27 @@
+apiVersion: nccl.infra.io/v1alpha1
+kind: TrainingHealthPolicy
+metadata:
+  name: llama-pretrain-health
+  namespace: ml-train
+spec:
+  targetRef:
+    apiVersion: kubeflow.org/v1
+    kind: PyTorchJob
+    namespace: ml-train
+    name: llama-pretrain
+    worldSize: 64
+  detectWindow: 45s
+  confirmWindow: 15s
+  smUtilFloorPct: 5
+  minDiskIoBytesPerSec: 10485760 # 10MB/s backoff during Lustre/NFS checkpoint syncs
+  fatalXids: [79, 94, 95]
+  phaseLeaseTTL:
+    eval: 3m
+    ckpt: 5m
+  remediation:
+    taintKey: gpu.infra.io/unhealthy
+    taintEffect: NoSchedule
+    warmSpareLabel: pool=gpu-spare
+    dcgmDiagLevel: 3
+    checkpointRoot: /mnt/lustre/checkpoints/llama-pretrain
+    webhookURL: https://bot.internal/v1/incidents
