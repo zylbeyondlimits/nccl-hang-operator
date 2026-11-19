@@ -45,6 +45,7 @@ type TrainingHealthPolicySpec struct {
 	ConfirmWindow        time.Duration   `json:"confirmWindow"`
 	SMUtilFloorPct       float32         `json:"smUtilFloorPct"`
 	MinDiskIOBytesPerSec uint64          `json:"minDiskIoBytesPerSec"`
+	MinRDMABytesPerSec   uint64          `json:"minRdmaBytesPerSec"`
 	FatalXids            []int32         `json:"fatalXids"`
 	PhaseLeaseTTL        PhaseLeaseTTL   `json:"phaseLeaseTTL"`
 	Remediation          RemediationSpec `json:"remediation"`

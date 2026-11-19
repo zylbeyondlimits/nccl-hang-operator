@@ -43,6 +43,7 @@ spec:
                 confirmWindow: { type: string, default: "15s" }
                 smUtilFloorPct: { type: number, default: 5 }
                 minDiskIoBytesPerSec: { type: integer, default: 10485760 }
+                minRdmaBytesPerSec: { type: integer, default: 1048576 }
                 fatalXids:
                   type: array
                   items: { type: integer }

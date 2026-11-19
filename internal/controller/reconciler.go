@@ -221,10 +221,21 @@ func (r *TrainingHealthReconciler) resetHealthy(policy *v1alpha1.TrainingHealthP
 	policy.Status.LastTransitionTime = now
 }
 
-// isLegitimatePause prevents false-positive kills during eval loops or active Lustre/NFS/S3 checkpoint flushes.
+// hasActiveRDMAProgress checks whether NIC ASIC counters (port_xmit_data / port_rcv_data)
+// show forward data movement with zero fabric/HW errors, distinguishing a legitimate slow
+// cross-switch InfiniBand/RoCE collective straggler from a true zero-progress deadlock.
+func hasActiveRDMAProgress(spec v1alpha1.TrainingHealthPolicySpec, s telemetry.RankSample) bool {
+	if s.IBErrDelta > 0 || s.RDMAHWErrorDelta > 0 {
+		return false
+	}
+	return spec.MinRDMABytesPerSec > 0 && s.RDMAProgressBytesPerSec >= spec.MinRDMABytesPerSec
+}
+
+// isLegitimatePause prevents false-positive kills during eval loops, active Lustre/NFS/S3 checkpoint
+// flushes, or slow-yet-progressing cross-switch RDMA collectives.
 func isLegitimatePause(spec v1alpha1.TrainingHealthPolicySpec, s telemetry.RankSample, now time.Time) bool {
 	if s.OpenCollective != nil && !s.OpenCollective.Completed {
-		return false // actively stalled inside an unfinished NCCL collective
+		return hasActiveRDMAProgress(spec, s) // slow fabric moving bytes -> back off; zero bytes -> hang
 	}
 	if s.SMUtilPct >= spec.SMUtilFloorPct {
 		return true // GPU still executing forward passes (e.g., eval loop)
@@ -265,17 +276,32 @@ func (r *TrainingHealthReconciler) detectAndIsolate(
 		if s.IBErrDelta > 0 {
 			return &samples[i], fmt.Sprintf("IB/RDMA error delta=%d on rank %d (%s)", s.IBErrDelta, s.Rank, s.NodeName)
 		}
+		if s.RDMAHWErrorDelta > 0 {
+			return &samples[i], fmt.Sprintf("ConnectX RDMA hw_counter error delta=%d on rank %d (%s)", s.RDMAHWErrorDelta, s.Rank, s.NodeName)
+		}
 	}
 
-	// 2. Detect open unfinished NCCL collective past DetectWindow, or wedged non-collective phase past lease.
+	// 2. If any rank is actively moving RDMA bytes on the fabric with zero IB/HW/Xid errors,
+	// a slow cross-switch collective (e.g., AllGather straggler) is still making forward progress.
+	var anyActiveRDMA bool
+	for i := range samples {
+		if hasActiveRDMAProgress(policy.Spec, samples[i]) {
+			anyActiveRDMA = true
+			break
+		}
+	}
+
+	// 3. Detect open unfinished NCCL collective past DetectWindow, or wedged non-collective phase past lease.
 	var openCollectiveStuck bool
 	var wedgedRank *telemetry.RankSample
 	for i := range samples {
 		s := samples[i]
 		if s.OpenCollective != nil && !s.OpenCollective.Completed && now.Sub(s.OpenCollective.StartedAt) >= policy.Spec.DetectWindow {
-			openCollectiveStuck = true
+			if !anyActiveRDMA {
+				openCollectiveStuck = true
+			}
 		}
-		if !isLegitimatePause(policy.Spec, s, now) && s.VRAMUsedMB > 0 {
+		if !anyActiveRDMA && !isLegitimatePause(policy.Spec, s, now) && s.VRAMUsedMB > 0 {
 			if wedgedRank == nil || s.LastCompletedSeqID < wedgedRank.LastCompletedSeqID {
 				wedgedRank = &samples[i]
 			}
@@ -286,7 +312,7 @@ func (r *TrainingHealthReconciler) detectAndIsolate(
 		return nil, ""
 	}
 
-	// 3. Diff Flight Recorder seq_ids across all ranks: the rank with the minimum LastCompletedSeqID
+	// 4. Diff Flight Recorder seq_ids across all ranks: the rank with the minimum LastCompletedSeqID
 	// (or the one without an open collective while peers wait inside AllReduce) is the true culprit.
 	var minSeq uint64 = math.MaxUint64
 	var culprit *telemetry.RankSample
